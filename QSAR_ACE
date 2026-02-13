@@ -1,0 +1,1768 @@
+# -*- coding: utf-8 -*-
+"""
+ACE-style Conformal Prediction for Classification (Integrated Pipeline + Decision Figures)
+(統合修正版 / SMOTE位置修正 + logit-gap + softplus温度 ACE v2 + CustomS v2 + 既存図/CSV + CustomS専用CSV/Excelシート)
+
+"""
+
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import pickle  
+
+from sklearn.preprocessing import PowerTransformer, StandardScaler
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    roc_auc_score, accuracy_score, f1_score, recall_score, precision_score,
+    confusion_matrix, matthews_corrcoef
+)
+from sklearn.ensemble import (
+    VotingClassifier, GradientBoostingClassifier, AdaBoostClassifier,
+    RandomForestClassifier, ExtraTreesClassifier
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
+from sklearn.neural_network import MLPClassifier
+from sklearn.base import clone
+
+try:
+    from xgboost import XGBClassifier
+except Exception:
+    XGBClassifier = None
+try:
+    from lightgbm import LGBMClassifier
+except Exception:
+    LGBMClassifier = None
+try:
+    from catboost import CatBoostClassifier
+except Exception:
+    CatBoostClassifier = None
+
+from imblearn.over_sampling import SMOTE
+import matplotlib.pyplot as plt
+
+# =========================
+# 追加の図作成ユーティリティ
+# =========================
+def fig_marginal_coverage_vs_alpha(input_csv="cls_cp_width_conditional_bins.csv",
+                                   out="fig_marginal_coverage_vs_alpha.png"):
+    import os, pandas as pd, matplotlib.pyplot as plt, numpy as np
+    if not os.path.exists(input_csv):
+        print("[Warn] Missing:", input_csv); return
+    df = pd.read_csv(input_csv)
+    g = (df.groupby(["Method","Alpha"])["Coverage_in_Bin"]
+            .mean().reset_index().sort_values("Alpha"))
+    methods = sorted(g["Method"].unique())
+    plt.figure(figsize=(8,5))
+    alphas_sorted = sorted(g["Alpha"].unique())
+    for m in methods:
+        sub = g[g["Method"]==m]
+        plt.plot(sub["Alpha"], sub["Coverage_in_Bin"], marker="o", label=m)
+    # 目標線（1-α）
+    plt.plot(alphas_sorted, [1-a for a in alphas_sorted], linestyle="--")
+    plt.xlabel("Alpha"); plt.ylabel("Observed Coverage (avg over bins)")
+    plt.title("Marginal Coverage vs Alpha")
+    plt.legend(); plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
+    print("[OK] Saved:", out)
+
+
+def fig_empty_singleton_vs_alpha(cp_summary_csv="cp_summary.csv",
+                                 out="fig_empty_singleton_vs_alpha.png"):
+    import os, pandas as pd, matplotlib.pyplot as plt
+    if not os.path.exists(cp_summary_csv):
+        print("[Warn] Missing:", cp_summary_csv); return
+    df = pd.read_csv(cp_summary_csv)
+    g_empty = df.groupby("Alpha")["EmptyRate"].mean().reset_index().sort_values("Alpha")
+    g_single = df.groupby("Alpha")["SingletonRate"].mean().reset_index().sort_values("Alpha")
+    plt.figure(figsize=(8,5))
+    plt.plot(g_empty["Alpha"], g_empty["EmptyRate"], marker="o", label="EmptyRate (avg)")
+    plt.plot(g_single["Alpha"], g_single["SingletonRate"], marker="o", label="SingletonRate (avg)")
+    plt.xlabel("Alpha"); plt.ylabel("Rate")
+    plt.title("Empty / Singleton vs Alpha (ACE)")
+    plt.legend(); plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
+    print("[OK] Saved:", out)
+
+
+def fig_ace_minus_homo_by_bin(alpha_focus=0.20,
+                              input_csv="cls_cp_width_conditional_bins.csv",
+                              out="fig_ace_minus_homo_by_bin.png"):
+    import os, pandas as pd, matplotlib.pyplot as plt
+    if not os.path.exists(input_csv):
+        print("[Warn] Missing:", input_csv); return
+    df = pd.read_csv(input_csv)
+    df = df[df["Alpha"].round(5)==round(alpha_focus,5)]
+    piv = (df.pivot_table(index=["Model","Bin"], columns="Method",
+                          values="Coverage_in_Bin", aggfunc="mean")
+             .reset_index().sort_values(["Model","Bin"]))
+    if not {"ACE","HOMO"}.issubset(piv.columns):
+        print("[Warn] ACE/HOMO not both present"); return
+    piv["ACE_minus_HOMO"] = piv["ACE"] - piv["HOMO"]
+    g = piv.groupby("Bin")["ACE_minus_HOMO"].mean().reset_index()
+    plt.figure(figsize=(6,4))
+    plt.plot(g["Bin"], g["ACE_minus_HOMO"], marker="o")
+    plt.axhline(0.0, linestyle="--")
+    plt.xticks([1,2,3,4,5]); plt.xlabel("Width Quintile (1=easy, 5=hard)")
+    plt.ylabel("Coverage(ACE) - Coverage(HOMO)")
+    plt.title(f"ACE advantage by width bin (alpha={alpha_focus:.2f})")
+    plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
+    print("[OK] Saved:", out)
+
+
+def fig_mae_by_model_bar(alpha_focus=0.20,
+                         input_csv="cls_cp_width_conditional_MAE.csv",
+                         out="fig_mae_by_model_bar.png"):
+    import os, pandas as pd, matplotlib.pyplot as plt, numpy as np
+    if not os.path.exists(input_csv):
+        print("[Warn] Missing:", input_csv); return
+    df = pd.read_csv(input_csv)
+    df = df[df["Alpha"].round(5)==round(alpha_focus,5)]
+    if "Model" not in df.columns:
+        g = (df.groupby("Method")["MAE_by_bins"].mean().reset_index())
+        plt.figure(figsize=(5,4))
+        plt.bar(range(len(g)), g["MAE_by_bins"].values)
+        plt.xticks(range(len(g)), g["Method"].values, rotation=0)
+        plt.ylabel("MAE_by_bins")
+        plt.title(f"Mean MAE_by_bins by method (alpha={alpha_focus:.2f})")
+        plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
+        print("[OK] Saved:", out); return
+    models = sorted(df["Model"].unique())
+    ace = df[df["Method"]=="ACE"].set_index("Model")["MAE_by_bins"]
+    hm  = df[df["Method"]=="HOMO"].set_index("Model")["MAE_by_bins"]
+    vals, labels = [], []
+    for m in models:
+        if m in ace.index and m in hm.index:
+            vals.extend([ace[m], hm[m]]); labels.extend([f"{m}-ACE", f"{m}-HOMO"])
+    plt.figure(figsize=(max(8,0.4*len(labels)),4.5))
+    plt.bar(range(len(vals)), vals)
+    plt.xticks(range(len(vals)), labels, rotation=90)
+    plt.ylabel("MAE_by_bins")
+    plt.title(f"Per-model MAE_by_bins (alpha={alpha_focus:.2f})")
+    plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
+    print("[OK] Saved:", out)
+
+
+def fig_biopla_votes_vs_prob(bio_csv="biopla_prediction_all_models.csv",
+                             prob_thr=0.70, out="fig_biopla_votes_vs_prob.png"):
+    import os, pandas as pd, matplotlib.pyplot as plt, numpy as np
+    if not os.path.exists(bio_csv):
+        print("[Warn] Missing:", bio_csv); return
+    df = pd.read_csv(bio_csv)
+    predset_cols = [c for c in df.columns if c.endswith("_PredSet")]
+    models = sorted(set(c[:-8] for c in predset_cols))
+    models = [m for m in models if f"{m}_Prob1" in df.columns]
+    if not models:
+        print("[Warn] No models found in biopla file"); return
+    votes, max_prob = [], []
+    for i in range(len(df)):
+        v = 0; pmax = 0.0
+        for m in models:
+            if df.loc[i, f"{m}_PredSet"] == "{active}" and df.loc[i, f"{m}_Prob1"] >= prob_thr:
+                v += 1
+            pmax = max(pmax, float(df.loc[i, f"{m}_Prob1"]))
+        votes.append(v); max_prob.append(pmax)
+    plt.figure(figsize=(6,4))
+    plt.scatter(votes, max_prob, s=10)
+    plt.axhline(prob_thr, linestyle="--")
+    plt.xlabel("votes_count (PredSet={active} & Prob1≥thr)"); plt.ylabel("max Prob1 across models")
+    plt.title("biopla: votes vs max Prob1")
+    plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
+    print("[OK] Saved:", out)
+
+
+def fig_bin_error_tendency(alpha_focus=0.20,
+                           input_csv="cls_cp_width_conditional_bins.csv",
+                           out="fig_bin_error_tendency.png"):
+    import os, pandas as pd, matplotlib.pyplot as plt, numpy as np
+    if not os.path.exists(input_csv):
+        print("[Warn] Missing:", input_csv); return
+    df = pd.read_csv(input_csv)
+    df = df[(df["Alpha"].round(5)==round(alpha_focus,5)) & (df["Method"]=="ACE")]
+    df["diff"] = df["Coverage_in_Bin"] - df["Nominal"]
+    g = df.groupby("Bin")["diff"].mean().reset_index()
+    plt.figure(figsize=(6,4))
+    plt.bar(g["Bin"], g["diff"])
+    plt.axhline(0.0, linestyle="--")
+    plt.xticks([1,2,3,4,5]); plt.xlabel("Width Quintile")
+    plt.ylabel("Coverage - Nominal (avg)")
+    plt.title(f"Tendency of under/over coverage (ACE, alpha={alpha_focus:.2f})")
+    plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
+    print("[OK] Saved:", out)
+
+
+def dump_params_cache(obj, path="params_cache.pkl"):
+    try:
+        with open(path, "wb") as f:
+            pickle.dump(obj, f)
+        print("[OK] Saved params cache:", path)
+    except Exception as e:
+        print("[Warn] params cache not saved:", e)
+
+
+def fig_temperature_hist(params_cache_pkl="params_cache.pkl",
+                         out="fig_temperature_hist.png", n_samples=2000):
+    import os, numpy as np, matplotlib.pyplot as plt, pickle as _pkl
+    if not os.path.exists(params_cache_pkl):
+        print("[Warn] Missing:", params_cache_pkl); return
+    with open(params_cache_pkl, "rb") as f:
+        cache = _pkl.load(f)
+    rng = np.random.RandomState(0)
+    sN = rng.normal(0, 1, size=n_samples)
+    Ts = []
+    for v in cache.values():
+        if len(v["params"])==3:  # v2
+            b0, b1, _ = v["params"]
+            T = np.log1p(np.exp(b0 + b1*sN)) + 1e-3
+            Ts.append(T)
+    if not Ts:
+        print("[Warn] no v2 params found"); return
+    T_all = np.concatenate(Ts)
+    plt.figure(figsize=(6,4))
+    plt.hist(T_all, bins=40)
+    plt.xlabel("Temperature T"); plt.ylabel("Frequency")
+    plt.title("Distribution of ACE temperatures (synthetic sN)")
+    plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
+    print("[OK] Saved:", out)
+
+
+def fig_efficiency_bar_from_summary(alpha_focus=0.20,
+                                    src="cp_summary.csv",
+                                    out="fig_efficiency_bar_alpha.png"):
+    """
+    各モデルの効率（Expected Set Size、小さいほど効率的）を棒グラフで出力。
+    ExpectedSetSize = 2 - SingletonRate - 2*EmptyRate
+    """
+    import os, pandas as pd, numpy as np, matplotlib.pyplot as plt
+    if not os.path.exists(src):
+        print("[Warn] Missing:", src); return
+    df = pd.read_csv(src)
+    df = df[df["Alpha"].round(5) == round(alpha_focus, 5)].copy()
+    if df.empty:
+        print(f"[Warn] No rows at alpha={alpha_focus} in {src}"); return
+    df["ExpectedSetSize"] = 2.0 - df["SingletonRate"] - 2.0*df["EmptyRate"]
+    df = df.sort_values(["ExpectedSetSize","EmptyRate","Model"])
+    plt.figure(figsize=(max(7, 0.35*len(df)), 5))
+    plt.bar(range(len(df)), df["ExpectedSetSize"].values)
+    plt.xticks(range(len(df)), df["Model"].values, rotation=90)
+    plt.ylabel("Expected Set Size (smaller is better)")
+    plt.title(f"Efficiency by Model (alpha={alpha_focus:.2f})")
+    plt.tight_layout()
+    out_path = out if out.endswith(".png") else f"fig_efficiency_bar_alpha{alpha_focus:.2f}.png"
+    plt.savefig(out_path, dpi=200); plt.close()
+    print("[OK] Saved:", out_path)
+
+
+def fig_efficiency_vs_alpha(src="cp_summary.csv",
+                            out="fig_efficiency_vs_alpha.png"):
+    """
+    Alpha を横軸に、モデル平均の Singleton / Empty / ExpectedSetSize を折れ線で表示。
+    """
+    import os, pandas as pd, numpy as np, matplotlib.pyplot as plt
+    if not os.path.exists(src):
+        print("[Warn] Missing:", src); return
+    df = pd.read_csv(src).copy()
+    if df.empty:
+        print("[Warn] cp_summary is empty"); return
+    df["ExpectedSetSize"] = 2.0 - df["SingletonRate"] - 2.0*df["EmptyRate"]
+    g = (df.groupby("Alpha")[["SingletonRate","EmptyRate","ExpectedSetSize"]]
+           .mean().reset_index().sort_values("Alpha"))
+    plt.figure(figsize=(8,5))
+    plt.plot(g["Alpha"], g["ExpectedSetSize"], marker="o", label="Expected Set Size")
+    plt.plot(g["Alpha"], g["SingletonRate"], marker="o", label="Singleton Rate")
+    plt.plot(g["Alpha"], g["EmptyRate"], marker="o", label="Empty Rate")
+    plt.xlabel("Alpha"); plt.ylabel("Value")
+    plt.title("Efficiency vs Alpha (model-avg)")
+    plt.legend()
+    plt.tight_layout(); plt.savefig(out, dpi=200); plt.close()
+    print("[OK] Saved:", out)
+
+
+def fig_efficiency_scatter(alpha_focus=0.20,
+                           src="cp_summary.csv",
+                           out="fig_efficiency_scatter_alpha.png"):
+    """
+    モデルごとの SingletonRate を横軸、EmptyRate を縦軸に散布図。
+    右下（Singleton↑・Empty↓）が望ましい。
+    """
+    import os, pandas as pd, matplotlib.pyplot as plt
+    if not os.path.exists(src):
+        print("[Warn] Missing:", src); return
+    df = pd.read_csv(src)
+    df = df[df["Alpha"].round(5) == round(alpha_focus, 5)].copy()
+    if df.empty:
+        print(f"[Warn] No rows at alpha={alpha_focus}"); return
+    plt.figure(figsize=(6,5))
+    plt.scatter(df["SingletonRate"], df["EmptyRate"])
+    for _, r in df.iterrows():
+        plt.text(r["SingletonRate"], r["EmptyRate"], r["Model"], fontsize=8)
+    plt.xlabel("Singleton Rate (higher is better)")
+    plt.ylabel("Empty Rate (lower is better)")
+    plt.title(f"Efficiency scatter by model (alpha={alpha_focus:.2f})")
+    plt.tight_layout()
+    out_path = out if out.endswith(".png") else f"fig_efficiency_scatter_alpha{alpha_focus:.2f}.png"
+    plt.savefig(out_path, dpi=200); plt.close()
+    print("[OK] Saved:", out_path)
+
+
+# ------------------------------------------------------------------
+# Parameters
+# ------------------------------------------------------------------
+ALPHA = 0.15
+CAL_SIZE = 0.20
+UNCERTAINTY_MODE = "logit-gap"
+RANDOM_STATE = 42
+
+ACE_KIND = "v2"
+ENFORCE_NONEMPTY = True
+EMPTY_RATE_FILTER = 0.10
+PROVIDER_STRATEGY = "balanced"
+
+ALPHAS_EVAL = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+ALPHA_FOR_PANEL = 0.20
+
+# --- 外部候補抽出（図とCSV） ---
+BIO_PROB_TH = 0.70
+BIO_VOTES_STRICT = 2
+BIO_VOTES_LOOSE  = 1
+
+# 追加（未使用なら無害）
+PROB_THRESH_GRID = [0.80, 0.75, 0.70, 0.65]
+VOTES_GRID       = [3, 2, 1]
+
+# --- 3モデル固定コンセンサス ---
+CONSENSUS_FIXED = ["KNN", "LDA", "LR"]
+
+# ------------------------------------------------------------------
+# Utilities & Uncertainty
+# ------------------------------------------------------------------
+def _clip01(x):
+    return np.clip(x, 1e-12, 1.0)
+
+def _uncertainty_from_proba(proba: np.ndarray, mode: str = "1-max") -> np.ndarray:
+    p = _clip01(proba)
+    if mode == "1-max":
+        return 1.0 - p.max(axis=1)
+    elif mode == "entropy":
+        return -(p * np.log(p)).sum(axis=1)
+    elif mode == "logit-gap":
+        part = np.partition(p, -2, axis=1)
+        p2 = part[:, -2]; p1 = part[:, -1]
+        logit_gap = np.abs((np.log(p1) - np.log(1.0 - p1)) - (np.log(p2) - np.log(1.0 - p2)))
+        return 1.0 / (logit_gap + 1e-8)
+    else:
+        raise ValueError("Unknown uncertainty mode")
+
+def _expected_set_size_from_scores(scores: np.ndarray, q: float) -> float:
+    return (scores <= q).sum(axis=1).mean()
+
+def _width_quintile_bins_from_proba(proba_t: np.ndarray, n_bins: int = 5):
+    pT = _clip01(proba_t)
+    u = -np.log(pT.max(axis=1))
+    order = np.argsort(u)
+    idx_bins = np.array_split(order, n_bins)
+    return idx_bins, u
+
+# ------------------------------------------------------------------
+# ACE (tanh 版; 比較用)
+# ------------------------------------------------------------------
+def compute_b_from_cal(proba_cal: np.ndarray, y_cal: np.ndarray, b_mode: str = "mean_nll") -> float:
+    p = _clip01(proba_cal)
+    if b_mode == "mean_nll":
+        y_idx = y_cal.astype(int)
+        nll = -np.log(np.take_along_axis(p, y_idx.reshape(-1, 1), axis=1).ravel())
+        b0 = float(np.mean(nll))
+    elif b_mode == "one_minus_maxp":
+        b0 = float(np.mean(1.0 - p.max(axis=1)))
+    else:
+        raise ValueError("b_mode must be 'mean_nll' or 'one_minus_maxp'")
+    return max(1e-6, b0)
+
+def cal_fit_params_tanh(
+    proba_cal: np.ndarray, y_cal: np.ndarray,
+    alpha: float = 0.15, mode: str = "1-max",
+    b_mode: str = "mean_nll",
+    b_scale_grid = (0.8, 1.0, 1.2),
+    a_frac_grid  = (0.25, 0.5, 0.75, 1.0),
+    gamma_grid   = tuple(np.linspace(-3.0, 3.0, 25))
+):
+    gamma_vals = np.array(gamma_grid, dtype=float)
+    gamma_vals = gamma_vals[np.abs(gamma_vals) >= 0.25]
+    if gamma_vals.size == 0:
+        gamma_vals = np.r_[np.linspace(-3, -0.3, 12), np.linspace(0.3, 3, 12)]
+
+    p = _clip01(proba_cal); y_idx = y_cal.astype(int)
+    s_cal = _uncertainty_from_proba(p, mode=mode)
+    s_mean, s_std = s_cal.mean(), s_cal.std() + 1e-8
+    b0 = compute_b_from_cal(p, y_cal, b_mode=b_mode)
+    b_candidates = [max(1e-6, float(k) * b0) for k in b_scale_grid]
+
+    best = None
+    for b in b_candidates:
+        for frac in a_frac_grid:
+            a = float(frac) * float(b)
+            for gamma in gamma_vals:
+                sN = (s_cal - s_mean) / (s_std + 1e-8)
+                sigma = a * np.tanh(sN) + b
+                T = np.exp(float(gamma) * sigma)
+                pT = p ** (1.0 / np.clip(T, 1e-6, None))[:, None]
+                pT = pT / pT.sum(axis=1, keepdims=True)
+                A = -np.log(np.take_along_axis(pT, y_idx.reshape(-1, 1), axis=1).ravel())
+                q = np.quantile(A, 1 - alpha)
+
+                bins, _u = _width_quintile_bins_from_proba(pT, n_bins=5)
+                target = 1.0 - alpha
+                covs = []
+                for bidx in bins:
+                    if len(bidx) == 0: continue
+                    covs.append(float(np.mean(A[bidx] <= q)))
+                if len(covs) == 0: continue
+                mae = float(np.mean([abs(c - target) for c in covs]))
+
+                marg_cov = float((A <= q).mean())
+                if marg_cov + 1e-3 < target:
+                    mae += (target - marg_cov) * 10.0
+
+                mae_adj = mae - 0.01 * float(np.std(T))
+                cand = (mae_adj, (float(a), float(b), float(gamma), float(q)))
+                if best is None or cand < best:
+                    best = cand
+
+    if best is None:
+        A0 = -np.log(np.take_along_axis(p, y_idx.reshape(-1, 1), axis=1).ravel())
+        q = float(np.quantile(A0, 1 - alpha))
+        return (0.5 * b0, b0, 1.0, q), (s_mean, s_std)
+    return best[1], (s_mean, s_std)
+
+def _apply_temperature_with_params_tanh(proba: np.ndarray, params, stats, mode: str = "1-max"):
+    (a, b, gamma, _q) = params
+    (s_mean, s_std) = stats
+    p = _clip01(proba)
+    s = _uncertainty_from_proba(p, mode=mode)
+    sN = (s - s_mean) / (s_std + 1e-8)
+    sigma = a * np.tanh(sN) + b
+    T = np.exp(float(gamma) * sigma)
+    pT = p ** (1.0 / np.clip(T, 1e-6, None))[:, None]
+    pT = pT / pT.sum(axis=1, keepdims=True)
+    return pT
+
+# ------------------------------------------------------------------
+# ACE v2（softplus 線形温度; 既定）
+# ------------------------------------------------------------------
+def _softplus(x):
+    return np.log1p(np.exp(x))
+
+def cal_fit_params_v2(
+    proba_cal, y_cal, alpha=0.15, mode="logit-gap",
+    beta0_grid=np.linspace(-2.5, 2.5, 9),
+    beta1_grid=np.linspace(0.0, 4.0, 9),
+    tau=1e-3
+):
+    p = _clip01(proba_cal); y_idx = y_cal.astype(int)
+    s = _uncertainty_from_proba(p, mode=mode)
+    s_mean, s_std = s.mean(), s.std() + 1e-8
+    sN = (s - s_mean) / (s_std + 1e-8)
+
+    target = 1.0 - alpha
+    best = None
+    for b0 in beta0_grid:
+        for b1 in beta1_grid:
+            T = _softplus(b0 + b1*sN) + tau
+            pT = p ** (1.0 / np.clip(T, 1e-6, None))[:, None]
+            pT = pT / pT.sum(axis=1, keepdims=True)
+            A = -np.log(np.take_along_axis(pT, y_idx.reshape(-1,1), axis=1).ravel())
+            q = np.quantile(A, 1 - alpha)
+
+            bins, _ = _width_quintile_bins_from_proba(pT, n_bins=5)
+            covs = [float(np.mean(A[b] <= q)) if len(b) else np.nan for b in bins]
+            mae = float(np.nanmean([abs(c - target) for c in covs]))
+
+            marg_cov = float(np.mean(A <= q))
+            if marg_cov + 1e-3 < target:
+                mae += (target - marg_cov) * 10.0
+
+            mae_adj = mae - 0.01 * float(np.std(T))
+            cand = (mae_adj, (float(b0), float(b1), float(q)), (s_mean, s_std))
+            if best is None or cand < best:
+                best = cand
+
+    if best is None:
+        A0 = -np.log(np.take_along_axis(p, y_idx.reshape(-1,1), axis=1).ravel())
+        q = float(np.quantile(A0, 1 - alpha))
+        return (0.0, 0.0, q), (s_mean, s_std)
+    return best[1], best[2]
+
+def _apply_temperature_with_params_v2(proba, params, stats, mode="logit-gap", tau=1e-3):
+    (b0, b1, _q) = params
+    (s_mean, s_std) = stats
+    p = _clip01(proba)
+    s = _uncertainty_from_proba(p, mode=mode)
+    sN = (s - s_mean) / (s_std + 1e-8)
+    T = _softplus(b0 + b1*sN) + tau
+    pT = p ** (1.0 / np.clip(T, 1e-6, None))[:, None]
+    pT = pT / pT.sum(axis=1, keepdims=True)
+    return pT
+
+# ------------------------------------------------------------------
+# HOMO ベースライン
+# ------------------------------------------------------------------
+def _params_homo(proba_cal, y_cal, alpha: float):
+    p = _clip01(proba_cal)
+    y_idx = y_cal.astype(int)
+    A = -np.log(np.take_along_axis(p, y_idx.reshape(-1, 1), axis=1).ravel())
+    q = float(np.quantile(A, 1 - alpha))
+    return (0.0, 0.0, 0.0, q), (0.0, 1.0)
+
+# ------------------------------------------------------------------
+# 共通：予測集合作成
+# ------------------------------------------------------------------
+def cp_predict_sets_generic(
+    proba_test: np.ndarray,
+    params, stats,
+    alpha: float,
+    mode: str,
+    label_order=("inactive","active"),
+    enforce_nonempty: bool=True,
+    temp_kind: str = "v2"
+):
+    if temp_kind == "v2":
+        pT = _apply_temperature_with_params_v2(proba_test, params, stats, mode=mode)
+        q = params[2]
+    elif temp_kind == "tanh":
+        pT = _apply_temperature_with_params_tanh(proba_test, params, stats, mode=mode)
+        q = params[3]
+    else:
+        raise ValueError("temp_kind must be 'v2' or 'tanh'")
+    scores = -np.log(_clip01(pT))
+
+    labels = np.array(label_order)
+    sets_str, singleton = [], []
+    for i in range(len(pT)):
+        idxs = np.where(scores[i] <= q)[0].tolist()
+        if enforce_nonempty and len(idxs) == 0:
+            idxs = [int(np.argmax(pT[i]))]
+        singleton.append(1 if len(idxs) == 1 else 0)
+        sets_str.append("{" + ",".join(labels[j] for j in idxs) + "}")
+    return sets_str, np.array(singleton), q
+
+def cp_eval_on_test(pred_sets_str, y_true, label_order=("inactive","active")):
+    lt = {0: label_order[0], 1: label_order[1]}
+    truth = [lt[int(y)] for y in (y_true.values if hasattr(y_true, "values") else y_true)]
+    contains, empty = [], []
+    for i in range(len(truth)):
+        s = pred_sets_str[i]
+        empty.append(s == "{}")
+        contains.append(truth[i] in s)
+    return float(np.mean(contains)), float(np.mean(empty))
+
+# ------------------------------------------------------------------
+# 幅分位（ACE vs HOMO）評価
+# ------------------------------------------------------------------
+def run_width_quintile_evaluation(
+    fitted_models: dict,
+    X_cal: np.ndarray, y_cal, X_test: np.ndarray, y_test,
+    alpha_list, mode: str,
+    ace_kind: str = "v2",
+    out_prefix: str = "cls_cp_width",
+    alpha_for_panel: float = 0.20,
+):
+    all_cond_rows, all_mae_rows = [], []
+    y_cal_np = (y_cal.values if hasattr(y_cal, "values") else y_cal).astype(int)
+    y_tst_np = (y_test.values if hasattr(y_test, "values") else y_test).astype(int)
+
+    for name, model in fitted_models.items():
+        proba_cal = model.predict_proba(X_cal)
+        proba_tst = model.predict_proba(X_test)
+
+        for a_ in alpha_list:
+            # ----- ACE -----
+            if ace_kind == "v2":
+                params_ace, stats_ace = cal_fit_params_v2(proba_cal, y_cal_np, alpha=a_, mode=mode)
+                p_tst_ace = _apply_temperature_with_params_v2(proba_tst, params_ace, stats_ace, mode=mode)
+                q_ace = params_ace[2]
+            else:
+                params_ace, stats_ace = cal_fit_params_tanh(proba_cal, y_cal_np, alpha=a_, mode=mode)
+                p_tst_ace = _apply_temperature_with_params_tanh(proba_tst, params_ace, stats_ace, mode=mode)
+                q_ace = params_ace[3]
+
+            A_ace = -np.log(np.take_along_axis(p_tst_ace, y_tst_np.reshape(-1, 1), axis=1).ravel())
+            bins_ace, _u = _width_quintile_bins_from_proba(p_tst_ace, n_bins=5)
+            target = 1.0 - a_
+            covs_ace = []
+            for k, bidx in enumerate(bins_ace, start=1):
+                cov = float(np.mean(A_ace[bidx] <= q_ace)) if len(bidx) else np.nan
+                covs_ace.append(cov)
+                all_cond_rows.append({
+                    "Model": name, "Alpha": a_, "Method": "ACE", "Bin": k,
+                    "Coverage_in_Bin": cov, "Nominal": target,
+                    "AbsError": (abs(cov - target) if np.isfinite(cov) else np.nan)
+                })
+            mae_ace = float(np.nanmean([abs(cov - target) for cov in covs_ace]))
+            all_mae_rows.append({"Model": name, "Alpha": a_, "Method": "ACE", "MAE_by_bins": mae_ace})
+
+            # ----- HOMO -----
+            params_hm, _ = _params_homo(proba_cal, y_cal_np, alpha=a_)
+            p_tst_hm = proba_tst
+            A_hm = -np.log(np.take_along_axis(p_tst_hm, y_tst_np.reshape(-1, 1), axis=1).ravel())
+            q_hm = params_hm[3]
+            bins_hm, _u = _width_quintile_bins_from_proba(p_tst_hm, n_bins=5)
+            covs_hm = []
+            for k, bidx in enumerate(bins_hm, start=1):
+                cov = float(np.mean(A_hm[bidx] <= q_hm)) if len(bidx) else np.nan
+                covs_hm.append(cov)
+                all_cond_rows.append({
+                    "Model": name, "Alpha": a_, "Method": "HOMO", "Bin": k,
+                    "Coverage_in_Bin": cov, "Nominal": target,
+                    "AbsError": (abs(cov - target) if np.isfinite(cov) else np.nan)
+                })
+            mae_hm = float(np.nanmean([abs(cov - target) for cov in covs_hm]))
+            all_mae_rows.append({"Model": name, "Alpha": a_, "Method": "HOMO", "MAE_by_bins": mae_hm})
+
+    cond_df = pd.DataFrame(all_cond_rows)
+    mae_df  = pd.DataFrame(all_mae_rows)
+    cond_path = f"{out_prefix}_conditional_bins.csv"
+    mae_path  = f"{out_prefix}_conditional_MAE.csv"
+    cond_df.to_csv(cond_path, index=False)
+    mae_df.to_csv(mae_path, index=False)
+    print(f"[OK] Saved: {cond_path} / {mae_path}")
+    
+    # 図A：ACEのみ、α=alpha_for_panel の幅クインタイル別カバレッジ（multi-panel）
+    sub = cond_df[(cond_df["Alpha"] == alpha_for_panel) & (cond_df["Method"] == "ACE")]
+    models_ = sorted(sub["Model"].unique())
+    if len(models_) > 0:
+        ncols = min(4, len(models_))
+        nrows = int(np.ceil(len(models_) / ncols))
+        plt.figure(figsize=(4*ncols, 3*nrows))
+        for i, m in enumerate(models_, 1):
+            msub = sub[sub["Model"] == m].sort_values("Bin")
+            plt.subplot(nrows, ncols, i)
+            plt.plot(msub["Bin"], msub["Coverage_in_Bin"], marker="o")
+            if len(msub) > 0:
+                t = float(msub["Nominal"].iloc[0])
+                plt.axhline(t, linestyle="--")
+            plt.xticks([1,2,3,4,5]); plt.ylim(0,1); plt.title(m)
+        plt.suptitle(f"Conditional Coverage by Width Quintile (ACE-{ace_kind}, alpha={alpha_for_panel:.2f})", y=1.02)
+        plt.tight_layout()
+        figA = "fig_width_bins_alpha{:.2f}.png".format(alpha_for_panel)
+        plt.savefig(figA, dpi=200); plt.close()
+        print(f"[OK] Saved: {figA}")
+
+    # 図B：平均MAE（ACE vs HOMO）
+    if len(mae_df) > 0:
+        g = (mae_df.groupby(["Method", "Alpha"])["MAE_by_bins"]
+                    .mean().reset_index().sort_values("Alpha"))
+        plt.figure(figsize=(8,5))
+        for method in ["ACE", "HOMO"]:
+            subm = g[g["Method"] == method]
+            if len(subm) == 0: continue
+            plt.plot(subm["Alpha"], subm["MAE_by_bins"], marker="o", label=method)
+        plt.xlabel("Alpha"); plt.ylabel("Mean MAE over width-quintiles (model-avg)")
+        plt.title(f"Conditional Coverage MAE vs Alpha (ACE-{ace_kind})"); plt.legend()
+        plt.tight_layout()
+        figB = "fig_width_mae_vs_alpha.png"
+        plt.savefig(figB, dpi=200); plt.close()
+        print(f"[OK] Saved: {figB}")
+
+# ------------------------------------------------------------------
+# Custom-S providers
+# ------------------------------------------------------------------
+def compute_s_forest_tree_std(forest_model, X, positive_class=1):
+    classes = list(getattr(forest_model, "classes_", [0,1]))
+    pos_idx = classes.index(positive_class) if positive_class in classes else np.argmax(classes)
+    probs = []
+    for est in forest_model.estimators_:
+        p = est.predict_proba(X)
+        probs.append(p[:, pos_idx])
+    P = np.vstack(probs)
+    return P.std(axis=0)
+
+def compute_s_gb_tail(gb_model, X, positive_class=1, tail=None):
+    n_estimators = getattr(gb_model, "n_estimators", None)
+    if n_estimators is None or n_estimators < 2:
+        p = gb_model.predict_proba(X)
+        return 1.0 - np.max(p, axis=1)
+    if tail is None:
+        tail = max(1, int(0.2 * n_estimators))
+    pos_idx = list(gb_model.classes_).index(positive_class) if positive_class in gb_model.classes_ else -1
+    seq = []
+    for P in gb_model.staged_predict_proba(X):
+        seq.append(P[:, pos_idx])
+    S = np.vstack(seq)
+    if S.shape[0] < 2:
+        return 1.0 - gb_model.predict_proba(X)[:, pos_idx]
+    dS = np.abs(np.diff(S, axis=0))
+    tail_dS = dS[-tail:, :] if dS.shape[0] >= tail else dS
+    s = tail_dS.mean(axis=0)
+    return s
+
+def compute_s_knn_vote_margin(knn_model, X):
+    P = knn_model.predict_proba(X)
+    part = np.partition(P, -2, axis=1)
+    p_second = part[:, -2]
+    p_max = part[:, -1]
+    return 1.0 - (p_max - p_second)
+
+class MultiSeedSProvider:
+    def __init__(self, base_estimator, seeds=(0,1,2,3,4), positive_class=1, fit_params=None):
+        self.base_estimator = base_estimator
+        self.seeds = list(seeds)
+        self.models = []
+        self.positive_class = positive_class
+        self.fit_params = fit_params or {}
+
+    def fit(self, X, y):
+        X = np.asarray(X); y = np.asarray(y)
+        self.models = []
+        for sd in self.seeds:
+            est = clone(self.base_estimator)
+            if hasattr(est, "random_state"):
+                try: est.set_params(random_state=sd)
+                except Exception: pass
+            est.fit(X, y, **self.fit_params)
+            self.models.append(est)
+        classes = list(getattr(self.models[0], "classes_", [0,1]))
+        self.pos_idx = classes.index(self.positive_class) if self.positive_class in classes else np.argmax(classes)
+        return self
+
+    def proba_matrix(self, X):
+        X = np.asarray(X)
+        probs = [m.predict_proba(X)[:, self.pos_idx] for m in self.models]
+        return np.vstack(probs)
+
+    def s_on(self, X):
+        P = self.proba_matrix(X)
+        return P.std(axis=0)
+
+    def mean_proba_on(self, X):
+        P = self.proba_matrix(X)
+        return P.mean(axis=0)
+
+class BootstrapSProvider:
+    def __init__(self, base_estimator, B=8, max_samples=0.8, random_state=0, positive_class=1, fit_params=None):
+        self.base_estimator = base_estimator
+        self.B = int(B)
+        self.max_samples = max_samples
+        self.random_state = int(random_state)
+        self.models = []
+        self.positive_class = positive_class
+        self.fit_params = fit_params or {}
+
+    def fit(self, X, y):
+        X = np.asarray(X); y = np.asarray(y)
+        rng = np.random.RandomState(self.random_state)
+        n = X.shape[0]; m = max(2, int(self.max_samples * n))
+        self.models = []
+        for _ in range(self.B):
+            idx = rng.randint(0, n, size=m)
+            est = clone(self.base_estimator)
+            est.fit(X[idx], y[idx], **self.fit_params)
+            self.models.append(est)
+        classes = list(getattr(self.models[0], "classes_", [0,1]))
+        self.pos_idx = classes.index(self.positive_class) if self.positive_class in classes else np.argmax(classes)
+        return self
+
+    def proba_matrix(self, X):
+        X = np.asarray(X)
+        probs = [m.predict_proba(X)[:, self.pos_idx] for m in self.models]
+        return np.vstack(probs)
+
+    def s_on(self, X):
+        P = self.proba_matrix(X)
+        return P.std(axis=0)
+
+def build_s_providers(model_dict, X_tr, y_tr, strategy="balanced"):
+    providers = {}
+    for name, model in model_dict.items():
+        mname = name.upper()
+        if mname in ("RF", "EXT", "EXTRATREES"):
+            class ForestWrapper:
+                def __init__(self, fitted_model): self.model = fitted_model
+                def fit(self, X, y): return self
+                def s_on(self, X): return compute_s_forest_tree_std(self.model, X, positive_class=1)
+            prov = ForestWrapper(model)
+        elif mname == "GB":
+            class GBWrapper:
+                def __init__(self, fitted_model, tail=None): self.model = fitted_model; self.tail = tail
+                def fit(self, X, y): return self
+                def s_on(self, X): return compute_s_gb_tail(self.model, X, positive_class=1, tail=self.tail)
+            tail = max(1, int(0.2) * getattr(model, "n_estimators", 100))
+            prov = GBWrapper(model, tail=tail)
+        elif mname == "KNN":
+            class KNNWrapper:
+                def __init__(self, fitted_model): self.model = fitted_model
+                def fit(self, X, y): return self
+                def s_on(self, X): return compute_s_knn_vote_margin(self.model, X)
+            prov = KNNWrapper(model)
+        else:
+            if strategy == "fast":
+                prov = MultiSeedSProvider(base_estimator=model, seeds=[0,1,2], positive_class=1)
+            elif strategy == "thorough":
+                prov = BootstrapSProvider(base_estimator=model, B=12, max_samples=0.8, random_state=0, positive_class=1)
+            else:
+                prov = MultiSeedSProvider(base_estimator=model, seeds=[0,1,2,3,4], positive_class=1)
+            prov.fit(X_tr, y_tr)
+        providers[name] = prov
+    return providers
+
+# ---- Custom-S 用 ACE v2 / tanh ----
+def cal_fit_params_custom_s_v2(
+    proba_cal: np.ndarray, y_cal: np.ndarray, s_cal: np.ndarray,
+    alpha: float = 0.15, beta0_grid=np.linspace(-2.5,2.5,9), beta1_grid=np.linspace(0.0,4.0,9), tau=1e-3
+):
+    p = _clip01(proba_cal); y_idx = y_cal.astype(int)
+    s_cal = np.asarray(s_cal).ravel()
+    s_mean, s_std = float(np.mean(s_cal)), float(np.std(s_cal) + 1e-8)
+    sN = (s_cal - s_mean) / (s_std + 1e-8)
+    target = 1.0 - alpha
+    best = None
+    for b0 in beta0_grid:
+        for b1 in beta1_grid:
+            T = _softplus(b0 + b1*sN) + tau
+            pT = p ** (1.0 / np.clip(T, 1e-6, None))[:, None]
+            pT = pT / pT.sum(axis=1, keepdims=True)
+            A = -np.log(np.take_along_axis(pT, y_idx.reshape(-1,1), axis=1).ravel())
+            q = np.quantile(A, 1 - alpha)
+            bins,_ = _width_quintile_bins_from_proba(pT, n_bins=5)
+            covs = [float(np.mean(A[b] <= q)) if len(b) else np.nan for b in bins]
+            mae = float(np.nanmean([abs(c - target) for c in covs]))
+            marg_cov = float(np.mean(A <= q))
+            if marg_cov + 1e-3 < target:
+                mae += (target - marg_cov) * 10.0
+            mae_adj = mae - 0.01 * float(np.std(T))
+            cand = (mae_adj, (float(b0), float(b1), float(q)), (s_mean, s_std))
+            if best is None or cand < best:
+                best = cand
+    if best is None:
+        A0 = -np.log(np.take_along_axis(p, y_idx.reshape(-1,1), axis=1).ravel())
+        q = float(np.quantile(A0, 1 - alpha))
+        return (0.0, 0.0, q), (s_mean, s_std)
+    return best[1], best[2]
+
+def _apply_temperature_with_params_custom_s_v2(proba, s_vec, params, stats):
+    (b0,b1,_q) = params
+    (s_mean,s_std) = stats
+    p = _clip01(proba)
+    sN = (np.asarray(s_vec).ravel() - s_mean) / (s_std + 1e-8)
+    T = _softplus(b0 + b1*sN) + 1e-3
+    pT = p ** (1.0 / np.clip(T, 1e-6, None))[:, None]
+    pT = pT / pT.sum(axis=1, keepdims=True)
+    return pT
+
+def cal_fit_params_custom_s_tanh(
+    proba_cal: np.ndarray, y_cal: np.ndarray, s_cal: np.ndarray,
+    alpha: float = 0.15, b_scale_grid=(0.8,1.0,1.2), a_frac_grid=(0.25,0.5,0.75,1.0),
+    gamma_grid=tuple(np.linspace(-3.0,3.0,25))
+):
+    gamma_vals = np.array(gamma_grid, dtype=float)
+    gamma_vals = gamma_vals[np.abs(gamma_vals) >= 0.25]
+    if gamma_vals.size == 0:
+        gamma_vals = np.r_[np.linspace(-3, -0.3, 12), np.linspace(0.3, 3, 12)]
+    p = _clip01(proba_cal); y_idx = y_cal.astype(int)
+    s_cal = np.asarray(s_cal).ravel()
+    s_mean, s_std = float(np.mean(s_cal)), float(np.std(s_cal) + 1e-8)
+    b0 = compute_b_from_cal(p, y_cal, b_mode="mean_nll")
+    b_candidates = [max(1e-6, float(k) * b0) for k in b_scale_grid]
+    best = None
+    for b in b_candidates:
+        for frac in a_frac_grid:
+            a = float(frac) * float(b)
+            for gamma in gamma_vals:
+                sN = (s_cal - s_mean) / (s_std + 1e-8)
+                sigma = a * np.tanh(sN) + b
+                T = np.exp(float(gamma) * sigma)
+                pT = p ** (1.0 / np.clip(T, 1e-6, None))[:, None]
+                pT = pT / pT.sum(axis=1, keepdims=True)
+                A = -np.log(np.take_along_axis(pT, y_idx.reshape(-1,1), axis=1).ravel())
+                q = np.quantile(A, 1 - alpha)
+                bins,_ = _width_quintile_bins_from_proba(pT, n_bins=5)
+                target = 1.0 - alpha
+                covs = [float(np.mean(A[b] <= q)) if len(b) else np.nan for b in bins]
+                mae = float(np.nanmean([abs(c - target) for c in covs]))
+                marg_cov = float(np.mean(A <= q))
+                if marg_cov + 1e-3 < target:
+                    mae += (target - marg_cov) * 10.0
+                mae_adj = mae - 0.01 * float(np.std(T))
+                cand = (mae_adj, (float(a), float(b), float(gamma), float(q)), (s_mean, s_std))
+                if best is None or cand < best:
+                    best = cand
+    if best is None:
+        A0 = -np.log(np.take_along_axis(p, y_idx.reshape(-1,1), axis=1).ravel())
+        q = float(np.quantile(A0, 1 - alpha))
+        return (0.5*b0, b0, 1.0, q), (s_mean, s_std)
+    return best[1], best[2]
+
+def _apply_temperature_with_params_custom_s_tanh(proba, s_vec, params, stats):
+    (a,b,gamma,_q) = params
+    (s_mean,s_std) = stats
+    p = _clip01(proba)
+    sN = (np.asarray(s_vec).ravel() - s_mean) / (s_std + 1e-8)
+    sigma = a * np.tanh(sN) + b
+    T = np.exp(float(gamma) * sigma)
+    pT = p ** (1.0 / np.clip(T, 1e-6, None))[:, None]
+    pT = pT / pT.sum(axis=1, keepdims=True)
+    return pT
+
+def run_width_quintile_evaluation_customS(
+    fitted_models, providers, X_cal, y_cal, X_test, y_test,
+    alpha_list, out_prefix="cls_cp_width_customS", alpha_for_panel=0.20,
+    ace_kind="v2"
+):
+    all_cond_rows, all_mae_rows = [], []
+    y_cal_np = (y_cal.values if hasattr(y_cal, "values") else y_cal).astype(int)
+    y_tst_np = (y_test.values if hasattr(y_test, "values") else y_test).astype(int)
+
+    for name, model in fitted_models.items():
+        proba_cal = model.predict_proba(X_cal)
+        proba_tst = model.predict_proba(X_test)
+        s_cal = providers[name].s_on(X_cal)
+        s_tst = providers[name].s_on(X_test)
+
+        for a_ in alpha_list:
+            if ace_kind == "v2":
+                params, stats = cal_fit_params_custom_s_v2(proba_cal, y_cal_np, s_cal, alpha=a_)
+                p_tst_ace = _apply_temperature_with_params_custom_s_v2(proba_tst, s_tst, params, stats)
+                q_ace = params[2]
+                method_label = "ACE_customS_v2"
+            else:
+                params, stats = cal_fit_params_custom_s_tanh(proba_cal, y_cal_np, s_cal, alpha=a_)
+                p_tst_ace = _apply_temperature_with_params_custom_s_tanh(proba_tst, s_tst, params, stats)
+                q_ace = params[3]
+                method_label = "ACE_customS"
+
+            A_ace = -np.log(np.take_along_axis(p_tst_ace, y_tst_np.reshape(-1,1), axis=1).ravel())
+            bins_ace,_ = _width_quintile_bins_from_proba(p_tst_ace, n_bins=5)
+            target = 1.0 - a_
+            covs_ace=[]
+            for k,bidx in enumerate(bins_ace, start=1):
+                cov = float(np.mean(A_ace[bidx] <= q_ace)) if len(bidx) else np.nan
+                covs_ace.append(cov)
+                all_cond_rows.append({
+                    "Model":name,"Alpha":a_,"Method":method_label,"Bin":k,
+                    "Coverage_in_Bin":cov,"Nominal":target,
+                    "AbsError": (abs(cov - target) if np.isfinite(cov) else np.nan)
+                })
+            mae_ace = float(np.nanmean([abs(cov - target) for cov in covs_ace]))
+            all_mae_rows.append({"Model":name,"Alpha":a_,"Method":method_label,"MAE_by_bins":mae_ace})
+
+            # HOMO（比較）
+            params_hm,_ = _params_homo(proba_cal, y_cal_np, alpha=a_)
+            p_tst_hm = proba_tst
+            A_hm = -np.log(np.take_along_axis(p_tst_hm, y_tst_np.reshape(-1,1), axis=1).ravel())
+            q_hm = params_hm[3]
+            bins_hm,_ = _width_quintile_bins_from_proba(p_tst_hm, n_bins=5)
+            covs_hm=[]
+            for k,bidx in enumerate(bins_hm, start=1):
+                cov = float(np.mean(A_hm[bidx] <= q_hm)) if len(bidx) else np.nan
+                covs_hm.append(cov)
+                all_cond_rows.append({
+                    "Model":name,"Alpha":a_,"Method":"HOMO","Bin":k,
+                    "Coverage_in_Bin":cov,"Nominal":target,
+                    "AbsError": (abs(cov - target) if np.isfinite(cov) else np.nan)
+                })
+            mae_hm = float(np.nanmean([abs(cov - target) for cov in covs_hm]))
+            all_mae_rows.append({"Model":name,"Alpha":a_,"Method":"HOMO","MAE_by_bins":mae_hm})
+
+    pd.DataFrame(all_cond_rows).to_csv(f"{out_prefix}_conditional_bins.csv", index=False)
+    pd.DataFrame(all_mae_rows).to_csv(f"{out_prefix}_conditional_MAE.csv", index=False)
+    print(f"[OK] Saved: {out_prefix}_conditional_bins.csv / {out_prefix}_conditional_MAE.csv")
+
+# ------------------------------------------------------------------
+# 追加の意思決定図（既存＋新規を統合）
+# ------------------------------------------------------------------
+def generate_decision_figures(
+    alpha_main=ALPHA, alpha_panel=ALPHA_FOR_PANEL,
+    prob_thr=BIO_PROB_TH, votes_strict=BIO_VOTES_STRICT, votes_loose=BIO_VOTES_LOOSE
+):
+    target = 1.0 - alpha_main
+
+    # 1) STD: |Coverage-Target| vs Singleton（ACE標準）
+    try:
+        std = pd.read_csv("cp_summary.csv")
+        std = std.loc[std["Alpha"].round(5) == round(alpha_main, 5)]
+        plt.figure(figsize=(6,5))
+        x = (std["Coverage"] - target).abs()
+        y = std["SingletonRate"]
+        for i, _m in enumerate(std["Model"]):
+            plt.scatter([x.iloc[i]], [y.iloc[i]])
+        plt.xlabel(f"|Coverage - {target:.2f}|")
+        plt.ylabel("SingletonRate")
+        plt.title(f"STD: |Coverage-Target| vs Singleton (alpha={alpha_main:.2f})")
+        plt.tight_layout(); plt.savefig("fig_cov_target_vs_singleton_STD.png", dpi=200); plt.close()
+        print("[OK] Saved: fig_cov_target_vs_singleton_STD.png")
+    except Exception as e:
+        print("[Warn] STD scatter not written:", e)
+
+    # 2) CustomS: |Coverage-Target| vs Singleton
+    try:
+        cus = pd.read_csv("cp_summary_customS.csv")
+        cus = cus.loc[cus["Alpha"].round(5) == round(alpha_main, 5)]
+        plt.figure(figsize=(6,5))
+        x = (cus["Coverage"] - target).abs()
+        y = cus["SingletonRate"]
+        for i, _m in enumerate(cus["Model"]):
+            plt.scatter([x.iloc[i]], [y.iloc[i]])
+        plt.xlabel(f"|Coverage - {target:.2f}|")
+        plt.ylabel("SingletonRate")
+        plt.title(f"CustomS: |Coverage-Target| vs Singleton (alpha={alpha_main:.2f})")
+        plt.tight_layout(); plt.savefig("fig_cov_target_vs_singleton_CUS.png", dpi=200); plt.close()
+        print("[OK] Saved: fig_cov_target_vs_singleton_CUS.png")
+    except Exception as e:
+        print("[Warn] CUS scatter not written:", e)
+
+    # 3) Bin=5 の安定性バー（ACE）
+    try:
+        bins_df = pd.read_csv("cls_cp_width_conditional_bins.csv")
+        sub = bins_df[
+            (bins_df["Method"] == "ACE") &
+            (bins_df["Bin"] == 5) &
+            (bins_df["Alpha"].round(5) == round(alpha_panel, 5))
+        ].copy()
+        sub["AbsError_chk"] = (sub["Coverage_in_Bin"] - sub["Nominal"]).abs()
+        sub["AbsError_use"] = np.where(sub["AbsError"].notna(), sub["AbsError"], sub["AbsError_chk"])
+        sub = sub.sort_values("AbsError_use")
+
+        plt.figure(figsize=(max(6, 0.35*len(sub)), 5))
+        plt.bar(range(len(sub)), sub["AbsError_use"].values)
+        plt.xticks(range(len(sub)), sub["Model"].values, rotation=90)
+        plt.ylabel("AbsError at Bin=5")
+        plt.title(f"ACE stability at hard bin (Bin=5), alpha={alpha_panel:.2f}")
+        plt.tight_layout(); plt.savefig("fig_bin5_abs_error_alpha0.20_ACE.png", dpi=200); plt.close()
+        print("[OK] Saved: fig_bin5_abs_error_alpha0.20_ACE.png")
+    except Exception as e:
+        print("[Warn] Bin5 bar not written:", e)
+
+    # 4) MAE(ACE) - MAE(HOMO) の α依存（0.0 を中央に）
+    try:
+        mae_df = pd.read_csv("cls_cp_width_conditional_MAE.csv")
+        g = (mae_df.groupby(["Method","Alpha"])["MAE_by_bins"]
+             .mean().reset_index().sort_values("Alpha"))
+        P = g.pivot(index="Alpha", columns="Method", values="MAE_by_bins")
+        if {"ACE","HOMO"}.issubset(P.columns):
+            diff = P["ACE"] - P["HOMO"]
+
+            import numpy as _np
+            y_vals = diff.values
+            m = float(_np.max(_np.abs(y_vals)))
+            pad = 0.1 * m
+            y_min, y_max = -(m + pad), (m + pad)
+
+            plt.figure(figsize=(7,5))
+            plt.plot(diff.index.values, y_vals, marker="o")
+            plt.axhline(0.0, linestyle="--")
+            plt.ylim(y_min, y_max)
+            plt.xlabel("Alpha"); plt.ylabel("ACE - HOMO (mean MAE)")
+            plt.title("ACE advantage (<0 is better)")
+            plt.tight_layout()
+            plt.savefig("fig_mae_diff_vs_alpha.png", dpi=200)
+            plt.close()
+            print("[OK] Saved: fig_mae_diff_vs_alpha.png")
+    except Exception as e:
+        print("[Warn] MAE diff plot not written:", e)
+
+    # 5) biopla: 票数分布と候補CSV
+    try:
+        if os.path.exists("biopla_prediction_all_models.csv"):
+            bio = pd.read_csv("biopla_prediction_all_models.csv")
+            predset_cols = [c for c in bio.columns if c.endswith("_PredSet")]
+            model_names = sorted(set(c[:-8] for c in predset_cols))
+            model_names = [m for m in model_names if f"{m}_Prob1" in bio.columns]
+            if model_names:
+                votes_mat = []
+                for m in model_names:
+                    cond = (bio[f"{m}_PredSet"] == "{active}") & (bio[f"{m}_Prob1"] >= prob_thr)
+                    votes_mat.append(cond.values.astype(int))
+                V = np.vstack(votes_mat).T
+                votes_count = V.sum(axis=1)
+
+                strict_idx = np.where(votes_count >= votes_strict)[0]
+                loose_idx  = np.where(votes_count >= votes_loose)[0]
+
+                bio_strict = bio.iloc[strict_idx].copy()
+                bio_loose  = bio.iloc[loose_idx].copy()
+                bio_strict["votes_count"] = votes_count[strict_idx]
+                bio_loose["votes_count"]  = votes_count[loose_idx]
+
+                bio_strict.to_csv(f"biopla_highconf_pos_votes{votes_strict}_thr{int(prob_thr*100)}.csv", index=False)
+                bio_loose.to_csv( f"biopla_highconf_pos_votes{votes_loose}_thr{int(prob_thr*100)}.csv",  index=False)
+
+                plt.figure(figsize=(6,4))
+                bins = np.arange(0, len(model_names)+2) - 0.5
+                plt.hist(votes_count, bins=bins)
+                plt.xlabel("votes_count"); plt.ylabel("frequency")
+                plt.title(f"biopla votes (PredSet={{active}}, Prob1≥{prob_thr:.2f})")
+                plt.tight_layout(); plt.savefig("fig_biopla_votes_hist_thr80.png", dpi=200); plt.close()
+                print("[OK] Saved: fig_biopla_votes_hist_thr80.png")
+    except Exception as e:
+        print("[Warn] biopla histogram not written:", e)
+
+    # --- New figures（追加） ---
+    try:
+        fig_marginal_coverage_vs_alpha("cls_cp_width_conditional_bins.csv",
+                                       out="fig_marginal_coverage_vs_alpha.png")
+        fig_empty_singleton_vs_alpha("cp_summary.csv",
+                                     out="fig_empty_singleton_vs_alpha.png")
+        fig_ace_minus_homo_by_bin(alpha_focus=alpha_panel,
+                                  input_csv="cls_cp_width_conditional_bins.csv",
+                                  out="fig_ace_minus_homo_by_bin.png")
+        fig_mae_by_model_bar(alpha_focus=alpha_panel,
+                             input_csv="cls_cp_width_conditional_MAE.csv",
+                             out="fig_mae_by_model_bar.png")
+        fig_biopla_votes_vs_prob(bio_csv="biopla_prediction_all_models.csv",
+                                 prob_thr=prob_thr,
+                                 out="fig_biopla_votes_vs_prob.png")
+        fig_bin_error_tendency(alpha_focus=alpha_panel,
+                               input_csv="cls_cp_width_conditional_bins.csv",
+                               out="fig_bin_error_tendency.png")
+        fig_temperature_hist(params_cache_pkl="params_cache.pkl",
+                             out="fig_temperature_hist.png")
+    except Exception as e:
+        print("[Warn] new figures not written:", e)
+
+# ------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------
+def main():
+    print("\n=== Data Loading & Preprocessing ===")
+    df = pd.read_csv("output_選択後.csv", encoding="cp932")
+    df = df[df["AC50_Active"] != ""]
+    df["AC50_Active"] = df["AC50_Active"].astype("category")
+    cat_names = list(df["AC50_Active"].cat.categories)   # e.g., ["inactive","active"]
+    label_names = (cat_names[0], cat_names[1])
+    y = df["AC50_Active"].cat.codes
+
+    X = df.iloc[:, 19:].copy()
+    X = X.dropna()
+    y = y.loc[X.index]
+
+    pt = PowerTransformer(method="yeo-johnson")
+    scaler = StandardScaler()
+    X_transformed = pt.fit_transform(X)
+    X_scaled = scaler.fit_transform(X_transformed)
+    vt = VarianceThreshold(threshold=1e-5)
+    X_reduced = vt.fit_transform(X_scaled)
+    selected_features = X.columns[vt.get_support()]
+
+    def remove_high_correlation(Xm: np.ndarray, threshold: float = 0.95):
+        corr_matrix = np.corrcoef(Xm, rowvar=False)
+        upper = np.triu(np.abs(corr_matrix), k=1)
+        to_drop = [i for i in range(upper.shape[0]) if any(upper[i] > threshold)]
+        keep = [i for i in range(Xm.shape[1]) if i not in to_drop]
+        return Xm[:, keep], keep
+
+    X_final, kept_idx = remove_high_correlation(X_reduced)
+    final_feature_names = selected_features[kept_idx]
+
+    # ---------- 生データで train/test を分ける ----------
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_final, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE
+    )
+    # ---------- 生の train を train/cal に分ける ----------
+    X_tr_raw, X_cal, y_tr_raw, y_cal = train_test_split(
+        X_train, y_train, test_size=CAL_SIZE, stratify=y_train, random_state=RANDOM_STATE
+    )
+    # ---------- SMOTE は学習用 (X_tr_raw,y_tr_raw) のみに適用 ----------
+    sm = SMOTE(random_state=RANDOM_STATE)
+    X_tr, y_tr = sm.fit_resample(X_tr_raw, y_tr_raw)
+
+    print(f"Train(raw): {X_tr_raw.shape[0]}, Train(SMOTE): {X_tr.shape[0]}, Cal(raw): {X_cal.shape[0]}, Test(raw): {X_test.shape[0]}")
+    print(f"Features used: {len(final_feature_names)}")
+
+    # -----------------------------
+    # Define models
+    # -----------------------------
+    models = {
+        "LR": LogisticRegression(C=10, penalty="l2", solver="lbfgs", max_iter=1000),
+        "RF": RandomForestClassifier(n_estimators=200, max_depth=None, random_state=RANDOM_STATE),
+        "SVM": SVC(C=10, gamma="scale", kernel="rbf", probability=True, random_state=RANDOM_STATE),
+        "KNN": KNeighborsClassifier(n_neighbors=7, weights="distance"),
+        "NB": GaussianNB(),
+        "GB": GradientBoostingClassifier(n_estimators=200, learning_rate=0.1, max_depth=5, random_state=RANDOM_STATE),
+        "ADB": AdaBoostClassifier(n_estimators=100, learning_rate=1.0, random_state=RANDOM_STATE),
+        "LDA": LinearDiscriminantAnalysis(solver="svd", shrinkage=None),
+        "QDA": QuadraticDiscriminantAnalysis(reg_param=0.0),
+        "MLP": MLPClassifier(hidden_layer_sizes=(100, 50), alpha=0.0001, learning_rate_init=0.001, max_iter=500, random_state=RANDOM_STATE),
+        "EXT": ExtraTreesClassifier(n_estimators=200, max_depth=None, random_state=RANDOM_STATE)
+    }
+    if XGBClassifier is not None:
+        models["XGB"] = XGBClassifier(use_label_encoder=False, eval_metric="logloss",
+                                      n_estimators=200, learning_rate=0.1, max_depth=6, random_state=RANDOM_STATE)
+    if LGBMClassifier is not None:
+        models["LGBM"] = LGBMClassifier(n_estimators=200, learning_rate=0.1, max_depth=10, random_state=RANDOM_STATE)
+    if CatBoostClassifier is not None:
+        models["CAT"] = CatBoostClassifier(iterations=200, learning_rate=0.1, depth=6, verbose=0, random_state=RANDOM_STATE)
+
+    print("\n=== Model Training & Evaluation (metrics + ACE-CP) ===")
+    method = "SMOTE"
+    model_results = {method: {}}
+    performance_rows, cp_summary_rows = [], []
+    params_cache = {}
+
+    # ---- 学習は SMOTE 後の X_tr,y_tr / 確率取得は Cal/Test 生データに対して ----
+    for name, model in models.items():
+        model.fit(X_tr, y_tr)
+
+        # metrics on Test
+        y_proba_test = model.predict_proba(X_test)
+        model_label_order = tuple(label_names[c] for c in model.classes_)
+        score_idx = list(model.classes_).index(1) if 1 in model.classes_ else 0
+        y_score = y_proba_test[:, score_idx]
+        y_pred = model.predict(X_test)
+
+        auc = roc_auc_score(y_test, y_score)
+        acc = accuracy_score(y_test, y_pred)
+        f1 = f1_score(y_test, y_pred)
+        sensitivity = recall_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred)
+        mcc = matthews_corrcoef(y_test, y_pred)
+        tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+        specificity = tn / (tn + fp) if (tn + fp) != 0 else 0.0
+
+        model_results[method][name] = {
+            "model": model,
+            "auc": auc, "accuracy": acc, "precision": precision, "f1": f1,
+            "sensitivity": sensitivity, "specificity": specificity, "mcc": mcc,
+            "confusion_matrix": {"TP": tp, "TN": tn, "FP": fp, "FN": fn},
+        }
+        performance_rows.append({
+            "Model": name, "AUC": auc, "Accuracy": acc, "Precision": precision,
+            "Recall": sensitivity, "Specificity": specificity, "F1": f1, "MCC": mcc
+        })
+
+        # --- ACE-CP (Cal 生データ) ---
+        proba_cal = model.predict_proba(X_cal)
+
+        if ACE_KIND == "v2":
+            params, stats = cal_fit_params_v2(proba_cal, (y_cal.values if hasattr(y_cal, "values") else y_cal),
+                                              alpha=ALPHA, mode=UNCERTAINTY_MODE)
+        else:
+            params, stats = cal_fit_params_tanh(proba_cal, (y_cal.values if hasattr(y_cal, "values") else y_cal),
+                                                alpha=ALPHA, mode=UNCERTAINTY_MODE)
+        params_cache[name] = {"params": params, "stats": stats, "label_order": model_label_order}
+
+        pred_sets, singleton_flags, q = cp_predict_sets_generic(
+            y_proba_test, params, stats, alpha=ALPHA, mode=UNCERTAINTY_MODE,
+            label_order=model_label_order, enforce_nonempty=ENFORCE_NONEMPTY, temp_kind=ACE_KIND
+        )
+        coverage, empty_rate = cp_eval_on_test(pred_sets, y_test, label_order=model_label_order)
+
+        model_results[method][name]["cp_pred_sets"] = pred_sets
+        model_results[method][name]["cp_singleton_rate"] = float(np.mean(singleton_flags))
+        model_results[method][name]["cp_q"] = float(q)
+        model_results[method][name]["cp_coverage"] = coverage
+        model_results[method][name]["cp_empty_rate"] = empty_rate
+
+        cp_summary_rows.append({
+            "Model": name, "Alpha": ALPHA, "SingletonRate": float(np.mean(singleton_flags)),
+            "q": float(q), "Coverage": coverage, "EmptyRate": empty_rate, "Mode": f"ACE-{ACE_KIND}"
+        })
+
+        print(f"{name:>4}: AUC={auc:.4f}, F1={f1:.4f}, MCC={mcc:.4f} | CP[α={ALPHA}] Cov={coverage:.3f}, "
+              f"Single={np.mean(singleton_flags):.3f}, Empty={empty_rate:.3f}")
+
+    # -----------------------------
+    # Consensus models (KNN + LDA + LR 固定)
+    # -----------------------------
+    fixed_names = [n for n in CONSENSUS_FIXED if n in models]
+    if len(fixed_names) < 2:
+        raise RuntimeError(f"[CONSENSUS] 指定モデルが見つかりません: {CONSENSUS_FIXED} のうち {fixed_names}")
+
+    # 3モデル固定ソフト投票
+    voting_fixed = VotingClassifier(
+        estimators=[(n, model_results[method][n]["model"]) for n in fixed_names],
+        voting="soft"
+    )
+    voting_fixed.fit(X_tr, y_tr)
+    proba_vf = voting_fixed.predict_proba(X_test)
+    pred_vf = voting_fixed.predict(X_test)
+    score_vf = proba_vf[:, list(voting_fixed.classes_).index(1)] if 1 in voting_fixed.classes_ else proba_vf[:, 0]
+
+    auc = roc_auc_score(y_test, score_vf)
+    acc = accuracy_score(y_test, pred_vf)
+    f1 = f1_score(y_test, pred_vf)
+    sensitivity = recall_score(y_test, pred_vf)
+    precision = precision_score(y_test, pred_vf)
+    mcc = matthews_corrcoef(y_test, pred_vf)
+    tn, fp, fn, tp = confusion_matrix(y_test, pred_vf).ravel()
+    specificity = tn / (tn + fp) if (tn + fp) != 0 else 0.0
+
+    proba_cal_vf = voting_fixed.predict_proba(X_cal)
+    label_order_vf = tuple(label_names[c] for c in voting_fixed.classes_)
+    if ACE_KIND == "v2":
+        params_vf, stats_vf = cal_fit_params_v2(proba_cal_vf, (y_cal.values if hasattr(y_cal, "values") else y_cal),
+                                                alpha=ALPHA, mode=UNCERTAINTY_MODE)
+    else:
+        params_vf, stats_vf = cal_fit_params_tanh(proba_cal_vf, (y_cal.values if hasattr(y_cal, "values") else y_cal),
+                                                  alpha=ALPHA, mode=UNCERTAINTY_MODE)
+    pred_sets_vf, singleton_vf, q_vf = cp_predict_sets_generic(
+        proba_vf, params_vf, stats_vf, alpha=ALPHA, mode=UNCERTAINTY_MODE,
+        label_order=label_order_vf, enforce_nonempty=ENFORCE_NONEMPTY, temp_kind=ACE_KIND
+    )
+    cov_vf, empty_vf = cp_eval_on_test(pred_sets_vf, y_test, label_order=label_order_vf)
+
+    model_results[method]["CONSENSUS_FILTERED"] = {
+        "model": voting_fixed,
+        "auc": auc, "accuracy": acc, "precision": precision, "f1": f1,
+        "sensitivity": sensitivity, "specificity": specificity, "mcc": mcc,
+        "cp_pred_sets": pred_sets_vf, "cp_singleton_rate": float(np.mean(singleton_vf)),
+        "cp_q": float(q_vf), "cp_coverage": cov_vf, "cp_empty_rate": empty_vf,
+        "used_models": fixed_names
+    }
+    print(f"[CONSENSUS_FIXED] Using(3): {fixed_names} | AUC={auc:.4f}, F1={f1:.4f}, MCC={mcc:.4f} | "
+          f"CP Cov={cov_vf:.3f}, Single={np.mean(singleton_vf):.3f}, Empty={empty_vf:.3f}")
+
+    # 重み付き（空集合率に応じた 1-Empty を重み）
+    weights = []
+    estimators = []
+    for n in fixed_names:
+        estimators.append((n, model_results[method][n]["model"]))
+        er = model_results[method][n]["cp_empty_rate"]
+        w = max(1e-3, 1.0 - er)
+        weights.append(w)
+
+    voting_weighted = VotingClassifier(estimators=estimators, voting="soft", weights=weights)
+    voting_weighted.fit(X_tr, y_tr)
+    proba_vw = voting_weighted.predict_proba(X_test)
+    pred_vw = voting_weighted.predict(X_test)
+    score_vw = proba_vw[:, list(voting_weighted.classes_).index(1)] if 1 in voting_weighted.classes_ else proba_vw[:, 0]
+
+    auc = roc_auc_score(y_test, score_vw)
+    acc = accuracy_score(y_test, pred_vw)
+    f1 = f1_score(y_test, pred_vw)
+    sensitivity = recall_score(y_test, pred_vw)
+    precision = precision_score(y_test, pred_vw)
+    mcc = matthews_corrcoef(y_test, pred_vw)
+    tn, fp, fn, tp = confusion_matrix(y_test, pred_vw).ravel()
+    specificity = tn / (tn + fp) if (tn + fp) != 0 else 0.0
+
+    proba_cal_vw = voting_weighted.predict_proba(X_cal)
+    label_order_vw = tuple(label_names[c] for c in voting_weighted.classes_)
+    if ACE_KIND == "v2":
+        params_vw, stats_vw = cal_fit_params_v2(proba_cal_vw, (y_cal.values if hasattr(y_cal, "values") else y_cal),
+                                                alpha=ALPHA, mode=UNCERTAINTY_MODE)
+    else:
+        params_vw, stats_vw = cal_fit_params_tanh(proba_cal_vw, (y_cal.values if hasattr(y_cal, "values") else y_cal),
+                                                  alpha=ALPHA, mode=UNCERTAINTY_MODE)
+    pred_sets_vw, singleton_vw, q_vw = cp_predict_sets_generic(
+        proba_vw, params_vw, stats_vw, alpha=ALPHA, mode=UNCERTAINTY_MODE,
+        label_order=label_order_vw, enforce_nonempty=ENFORCE_NONEMPTY, temp_kind=ACE_KIND
+    )
+    cov_vw, empty_vw = cp_eval_on_test(pred_sets_vw, y_test, label_order=label_order_vw)
+
+    model_results[method]["CONSENSUS_WEIGHTED"] = {
+        "model": voting_weighted,
+        "auc": auc, "accuracy": acc, "precision": precision, "f1": f1,
+        "sensitivity": sensitivity, "specificity": specificity, "mcc": mcc,
+        "cp_pred_sets": pred_sets_vw, "cp_singleton_rate": float(np.mean(singleton_vw)),
+        "cp_q": float(q_vw), "cp_coverage": cov_vw, "cp_empty_rate": empty_vw,
+        "weights": dict(zip([n for n,_ in estimators], weights)),
+        "used_models": fixed_names
+    }
+    print(f"[CONSENSUS_WEIGHTED_FIXED] Using(3): {fixed_names} | weights~(1-empty): {model_results[method]['CONSENSUS_WEIGHTED']['weights']} | "
+          f"AUC={auc:.4f}, F1={f1:.4f}, MCC={mcc:.4f} | CP Cov={cov_vw:.3f}, Single={np.mean(singleton_vw):.3f}, Empty={empty_vw:.3f}")
+
+    # -----------------------------
+    # ACE with custom s providers (per model)
+    # -----------------------------
+    print("\n=== ACE with custom s providers (per model) ===")
+    providers = build_s_providers(models, X_tr, y_tr, strategy=PROVIDER_STRATEGY)
+    results_custom_s = {}
+    cp_custom_rows = []
+    y_cal_np = (y_cal.values if hasattr(y_cal, "values") else y_cal).astype(int)
+
+    for mname, clf in models.items():
+        proba_cal = clf.predict_proba(X_cal)
+        proba_tst = clf.predict_proba(X_test)
+        s_cal = providers[mname].s_on(X_cal)
+        s_tst = providers[mname].s_on(X_test)
+
+        if ACE_KIND == "v2":
+            params_cs, stats_cs = cal_fit_params_custom_s_v2(proba_cal, y_cal_np, s_cal, alpha=ALPHA)
+            p_tst_cs = _apply_temperature_with_params_custom_s_v2(proba_tst, s_tst, params_cs, stats_cs)
+            q_cs = params_cs[2]
+            mode_label = "CustomS_v2"
+        else:
+            params_cs, stats_cs = cal_fit_params_custom_s_tanh(proba_cal, y_cal_np, s_cal, alpha=ALPHA)
+            p_tst_cs = _apply_temperature_with_params_custom_s_tanh(proba_tst, s_tst, params_cs, stats_cs)
+            q_cs = params_cs[3]
+            mode_label = "CustomS_tanh"
+
+        label_order_m = tuple(label_names[c] for c in clf.classes_)
+        scores = -np.log(_clip01(p_tst_cs))
+        sets_str, singleton = [], []
+        labels = np.array(label_order_m)
+        for i in range(len(p_tst_cs)):
+            idxs = np.where(scores[i] <= q_cs)[0].tolist()
+            if ENFORCE_NONEMPTY and len(idxs)==0:
+                idxs = [int(np.argmax(p_tst_cs[i]))]
+            singleton.append(1 if len(idxs)==1 else 0)
+            sets_str.append("{" + ",".join(labels[j] for j in idxs) + "}")
+        coverage, empty_rate = cp_eval_on_test(sets_str, y_test, label_order=label_order_m)
+
+        results_custom_s[mname] = {
+            "cp_pred_sets": sets_str, "cp_singleton_rate": float(np.mean(singleton)),
+            "q": float(q_cs), "cp_coverage": coverage, "cp_empty_rate": empty_rate
+        }
+        cp_custom_rows.append({
+            "Model": mname, "Alpha": ALPHA, "SingletonRate": float(np.mean(singleton)),
+            "q": float(q_cs), "Coverage": coverage, "EmptyRate": empty_rate, "Mode": mode_label
+        })
+        print(f"[CustomS-{mode_label}] {mname}: Cov={coverage:.3f}, Single={np.mean(singleton):.3f}, q={q_cs:.3f}")
+
+    # -----------------------------
+    # Save CSVs
+    # -----------------------------
+    pd.DataFrame(performance_rows).to_csv("performance_table.csv", index=False)
+
+    conf_df = pd.DataFrame(
+        [{"Model": n, **model_results[method][n]["confusion_matrix"]} for n in models.keys()]
+    )
+    empty_row = pd.DataFrame([[""] * len(conf_df.columns)], columns=conf_df.columns)
+    conf_df = pd.concat([conf_df, empty_row], ignore_index=True)
+    summary_info = [
+        {"Model": "Summary", "TP": f"Train(raw): {X_tr_raw.shape[0]}", "TN": "", "FP": "", "FN": ""},
+        {"Model": "", "TP": f"Train(SMOTE): {X_tr.shape[0]}", "TN": "", "FP": "", "FN": ""},
+        {"Model": "", "TP": f"Cal(raw): {X_cal.shape[0]}", "TN": "", "FP": "", "FN": ""},
+        {"Model": "", "TP": f"Test(raw): {X_test.shape[0]}", "TN": "", "FP": "", "FN": ""},
+        {"Model": "", "TP": f"Descriptors used: {len(final_feature_names)}", "TN": "", "FP": "", "FN": ""}
+    ]
+    conf_df = pd.concat([conf_df, pd.DataFrame(summary_info)], ignore_index=True)
+    conf_df.to_csv("confusion_matrix_table.csv", index=False)
+
+    pd.DataFrame(cp_summary_rows).to_csv("cp_summary.csv", index=False)
+    pd.DataFrame(cp_custom_rows).to_csv("cp_summary_customS.csv", index=False)
+    
+    # ▼ 効率（Expected Set Size）の図を書き出し
+    fig_efficiency_bar_from_summary(alpha_focus=ALPHA_FOR_PANEL,
+                                src="cp_summary.csv",
+                                out="fig_efficiency_bar_alpha.png")
+    fig_efficiency_scatter(alpha_focus=ALPHA_FOR_PANEL,
+                       src="cp_summary.csv",
+                       out="fig_efficiency_scatter_alpha.png")
+    fig_efficiency_vs_alpha(src="cp_summary.csv",
+                        out="fig_efficiency_vs_alpha.png")
+
+    # ▼ ACE温度のヒスト作図用にパラメータを保存
+    dump_params_cache(params_cache, "params_cache.pkl")
+
+    # -----------------------------
+    # 幅分位評価 & 図（ACE vs HOMO）
+    # -----------------------------
+    print("\n=== Width-quintile evaluation & figures (ACE vs HOMO) ===")
+    fitted = {name: model_results[method][name]["model"] for name in models.keys()}
+    run_width_quintile_evaluation(
+        fitted_models=fitted,
+        X_cal=X_cal, y_cal=y_cal,
+        X_test=X_test, y_test=y_test,
+        alpha_list=ALPHAS_EVAL,
+        mode=UNCERTAINTY_MODE,
+        ace_kind=ACE_KIND,
+        out_prefix="cls_cp_width",
+        alpha_for_panel=ALPHA_FOR_PANEL,
+    )
+    run_width_quintile_evaluation_customS(
+        fitted_models=fitted,
+        providers=build_s_providers(models, X_tr, y_tr, strategy=PROVIDER_STRATEGY),
+        X_cal=X_cal, y_cal=y_cal,
+        X_test=X_test, y_test=y_test,
+        alpha_list=ALPHAS_EVAL,
+        out_prefix="cls_cp_width_customS",
+        alpha_for_panel=ALPHA_FOR_PANEL,
+        ace_kind=ACE_KIND
+    )
+
+    # -----------------------------
+    # External predictions on biopla_output.csv
+    #   - STD ACE（logit-gap） → biopla_prediction_all_models.csv
+    #   - CustomS ACE          → biopla_prediction_all_models_customS.csv
+    #     * base models + CONSENSUS_FILTERED + CONSENSUS_WEIGHTED
+    # -----------------------------
+    print("\n=== Predict on biopla_output.csv (STD ACE + CustomS, incl. Consensus) ===")
+    if os.path.exists("biopla_output.csv"):
+        bio_df = pd.read_csv("biopla_output.csv", encoding="cp932")
+        missing_cols = [c for c in X.columns if c not in bio_df.columns]
+        if missing_cols:
+            raise ValueError(f"[biopla_output.csv] Missing required feature columns: {missing_cols[:10]}...")
+
+        bio_X = bio_df.loc[:, X.columns].copy().dropna()
+        bio_df = bio_df.loc[bio_X.index]
+        bio_X_transformed = pt.transform(bio_X)
+        bio_X_scaled = scaler.transform(bio_X_transformed)
+        bio_X_reduced = vt.transform(bio_X_scaled)
+        bio_X_final = bio_X_reduced[:, kept_idx]
+
+        rows_std = []
+        rows_cs  = []
+
+        # base models（LR, RF, ...）の STD + CustomS
+        for name in models.keys():
+            clf = model_results[method][name]["model"]
+            lbl_order = params_cache[name]["label_order"]
+            p = clf.predict_proba(bio_X_final)
+            pred = clf.predict(bio_X_final)
+
+            # --- STD ACE（logit-gap） PredSet ---
+            params_std = params_cache[name]["params"]
+            stats_std  = params_cache[name]["stats"]
+            sets_std, _, _ = cp_predict_sets_generic(
+                p, params_std, stats_std,
+                alpha=ALPHA, mode=UNCERTAINTY_MODE,
+                label_order=lbl_order,
+                enforce_nonempty=ENFORCE_NONEMPTY,
+                temp_kind=ACE_KIND
+            )
+            cls_to_name = {int(c): lbl_order[i] for i, c in enumerate(clf.classes_)}
+            pred_names = [cls_to_name[int(c)] for c in pred]
+            score_idx = list(clf.classes_).index(1) if 1 in clf.classes_ else 0
+
+            for i in range(len(pred)):
+                rows_std.append({
+                    "Model": name,
+                    "Index": bio_df.index[i],
+                    "Predicted_Probability_of_1": float(p[i, score_idx]),
+                    "Predicted_Class": pred_names[i],
+                    "PredSet": sets_std[i],
+                })
+
+            # --- CustomS ACE PredSet（per-model provider を利用） ---
+            s_cal = providers[name].s_on(X_cal)
+            s_bio = providers[name].s_on(bio_X_final)
+
+            if ACE_KIND == "v2":
+                params_cs, stats_cs = cal_fit_params_custom_s_v2(
+                    clf.predict_proba(X_cal), y_cal_np, s_cal, alpha=ALPHA
+                )
+                pT_bio_cs = _apply_temperature_with_params_custom_s_v2(p, s_bio, params_cs, stats_cs)
+                q_cs = params_cs[2]
+            else:
+                params_cs, stats_cs = cal_fit_params_custom_s_tanh(
+                    clf.predict_proba(X_cal), y_cal_np, s_cal, alpha=ALPHA
+                )
+                pT_bio_cs = _apply_temperature_with_params_custom_s_tanh(p, s_bio, params_cs, stats_cs)
+                q_cs = params_cs[3]
+
+            scores_cs = -np.log(_clip01(pT_bio_cs))
+            labels = np.array(lbl_order)
+            sets_cs = []
+            for i in range(len(p)):
+                idxs = np.where(scores_cs[i] <= q_cs)[0].tolist()
+                if ENFORCE_NONEMPTY and len(idxs) == 0:
+                    idxs = [int(np.argmax(pT_bio_cs[i]))]
+                sets_cs.append("{" + ",".join(labels[j] for j in idxs) + "}")
+
+            for i in range(len(pred)):
+                rows_cs.append({
+                    "Model": name,
+                    "Index": bio_df.index[i],
+                    "Predicted_Probability_of_1": float(p[i, score_idx]),
+                    "Predicted_Class": pred_names[i],
+                    "PredSet_CustomS": sets_cs[i],
+                })
+
+        # --- Consensus models (STD ACE; 既存ロジックそのまま) ---
+        for cname in ["CONSENSUS_FILTERED", "CONSENSUS_WEIGHTED"]:
+            if cname in model_results[method]:
+                clf = model_results[method][cname]["model"]
+                lbl_order = tuple(label_names[c] for c in clf.classes_)
+                p = clf.predict_proba(bio_X_final)
+                pred = clf.predict(bio_X_final)
+                proba_cal = clf.predict_proba(X_cal)
+
+                # STD ACE（logit-gap）で calibration
+                if ACE_KIND == "v2":
+                    params, stats = cal_fit_params_v2(
+                        proba_cal, y_cal_np, alpha=ALPHA, mode=UNCERTAINTY_MODE
+                    )
+                else:
+                    params, stats = cal_fit_params_tanh(
+                        proba_cal, y_cal_np, alpha=ALPHA, mode=UNCERTAINTY_MODE
+                    )
+                sets, _, _ = cp_predict_sets_generic(
+                    p, params, stats, alpha=ALPHA, mode=UNCERTAINTY_MODE,
+                    label_order=lbl_order, enforce_nonempty=ENFORCE_NONEMPTY,
+                    temp_kind=ACE_KIND
+                )
+                cls_to_name = {int(c): lbl_order[i] for i, c in enumerate(clf.classes_)}
+                pred_names = [cls_to_name[int(c)] for c in pred]
+                score_idx = list(clf.classes_).index(1) if 1 in clf.classes_ else 0
+
+                for i in range(len(pred)):
+                    rows_std.append({
+                        "Model": cname,
+                        "Index": bio_df.index[i],
+                        "Predicted_Probability_of_1": float(p[i, score_idx]),
+                        "Predicted_Class": pred_names[i],
+                        "PredSet": sets[i],
+                    })
+
+        # --- Consensus models の CustomS ---
+        #     s は「ベース3モデル（KNN, LDA, LR）の Prob1 の標準偏差」を使う
+        for cname in ["CONSENSUS_FILTERED", "CONSENSUS_WEIGHTED"]:
+            if cname in model_results[method]:
+                clf = model_results[method][cname]["model"]
+                lbl_order = tuple(label_names[c] for c in clf.classes_)
+                proba_cal = clf.predict_proba(X_cal)
+                proba_bio = clf.predict_proba(bio_X_final)
+
+                used_base = model_results[method][cname]["used_models"]  # 例: ["KNN","LDA","LR"]
+
+                # base3 の Prob1 から s_cal / s_bio を作る
+                base_probs_cal = []
+                base_probs_bio = []
+                for base_name in used_base:
+                    base_clf = model_results[method][base_name]["model"]
+                    p_cal_b = base_clf.predict_proba(X_cal)
+                    p_bio_b = base_clf.predict_proba(bio_X_final)
+                    idx1_b = list(base_clf.classes_).index(1) if 1 in base_clf.classes_ else 0
+                    base_probs_cal.append(p_cal_b[:, idx1_b])
+                    base_probs_bio.append(p_bio_b[:, idx1_b])
+                S_cal = np.vstack(base_probs_cal)   # shape: (n_base, n_cal)
+                S_bio = np.vstack(base_probs_bio)   # shape: (n_base, n_bio)
+                s_cal = S_cal.std(axis=0)
+                s_bio = S_bio.std(axis=0)
+
+                # CustomS ACE calibration
+                if ACE_KIND == "v2":
+                    params_cs, stats_cs = cal_fit_params_custom_s_v2(
+                        proba_cal, y_cal_np, s_cal, alpha=ALPHA
+                    )
+                    pT_bio_cs = _apply_temperature_with_params_custom_s_v2(
+                        proba_bio, s_bio, params_cs, stats_cs
+                    )
+                    q_cs = params_cs[2]
+                else:
+                    params_cs, stats_cs = cal_fit_params_custom_s_tanh(
+                        proba_cal, y_cal_np, s_cal, alpha=ALPHA
+                    )
+                    pT_bio_cs = _apply_temperature_with_params_custom_s_tanh(
+                        proba_bio, s_bio, params_cs, stats_cs
+                    )
+                    q_cs = params_cs[3]
+
+                scores_cs = -np.log(_clip01(pT_bio_cs))
+                labels = np.array(lbl_order)
+                sets_cs = []
+                for i in range(len(proba_bio)):
+                    idxs = np.where(scores_cs[i] <= q_cs)[0].tolist()
+                    if ENFORCE_NONEMPTY and len(idxs) == 0:
+                        idxs = [int(np.argmax(pT_bio_cs[i]))]
+                    sets_cs.append("{" + ",".join(labels[j] for j in idxs) + "}")
+
+                pred = clf.predict(bio_X_final)
+                cls_to_name = {int(c): lbl_order[i] for i, c in enumerate(clf.classes_)}
+                pred_names = [cls_to_name[int(c)] for c in pred]
+                idx1_cons = list(clf.classes_).index(1) if 1 in clf.classes_ else 0
+
+                for i in range(len(pred)):
+                    rows_cs.append({
+                        "Model": cname,
+                        "Index": bio_df.index[i],
+                        "Predicted_Probability_of_1": float(proba_bio[i, idx1_cons]),
+                        "Predicted_Class": pred_names[i],
+                        "PredSet_CustomS": sets_cs[i],
+                    })
+
+        # ---- STD 用 CSV ----
+        pred_df_std = pd.DataFrame(rows_std)
+        prob_pivot = pred_df_std.pivot(index="Index", columns="Model",
+                                       values="Predicted_Probability_of_1")
+        class_pivot = pred_df_std.pivot(index="Index", columns="Model",
+                                        values="Predicted_Class")
+        set_pivot = pred_df_std.pivot(index="Index", columns="Model",
+                                      values="PredSet")
+
+        prob_pivot.columns = [f"{c}_Prob1" for c in prob_pivot.columns]
+        class_pivot.columns = [f"{c}_Class" for c in class_pivot.columns]
+        set_pivot.columns = [f"{c}_PredSet" for c in set_pivot.columns]
+
+        bio_result_std = pd.concat([
+            bio_df.reset_index(drop=True),
+            prob_pivot.reset_index(drop=True),
+            class_pivot.reset_index(drop=True),
+            set_pivot.reset_index(drop=True)
+        ], axis=1)
+        bio_result_std.to_csv("biopla_prediction_all_models.csv", index=False)
+        print("[OK] Saved: biopla_prediction_all_models.csv")
+
+        # ---- CustomS 用 CSV（base + consensus）----
+        pred_df_cs = pd.DataFrame(rows_cs)
+        if not pred_df_cs.empty:
+            prob_pivot_cs = pred_df_cs.pivot(index="Index", columns="Model",
+                                             values="Predicted_Probability_of_1")
+            class_pivot_cs = pred_df_cs.pivot(index="Index", columns="Model",
+                                              values="Predicted_Class")
+            set_pivot_cs = pred_df_cs.pivot(index="Index", columns="Model",
+                                            values="PredSet_CustomS")
+
+            prob_pivot_cs.columns = [f"{c}_Prob1" for c in prob_pivot_cs.columns]
+            class_pivot_cs.columns = [f"{c}_Class" for c in class_pivot_cs.columns]
+            set_pivot_cs.columns = [f"{c}_PredSet_CustomS" for c in set_pivot_cs.columns]
+
+            bio_result_cs = pd.concat([
+                bio_df.reset_index(drop=True),
+                prob_pivot_cs.reset_index(drop=True),
+                class_pivot_cs.reset_index(drop=True),
+                set_pivot_cs.reset_index(drop=True)
+            ], axis=1)
+            bio_result_cs.to_csv("biopla_prediction_all_models_customS.csv", index=False)
+            print("[OK] Saved: biopla_prediction_all_models_customS.csv")
+    else:
+        print("biopla_output.csv not found. Skipping external prediction.")
+
+    # -----------------------------
+    # 追加の意思決定図（既存＋新規）※ biopla の後に生成
+    # -----------------------------
+    print("\n=== Generating decision figures ===")
+    generate_decision_figures(
+        alpha_main=ALPHA,
+        alpha_panel=ALPHA_FOR_PANEL,
+        prob_thr=BIO_PROB_TH,
+        votes_strict=BIO_VOTES_STRICT,
+        votes_loose=BIO_VOTES_LOOSE
+    )
+
+    # -----------------------------
+    # Excel summary
+    # -----------------------------
+    try:
+        import openpyxl
+        from pandas import ExcelWriter
+        print("\n=== Writing Excel outputs (summary) ===")
+        perf_df = pd.DataFrame(performance_rows)
+        cp_df = pd.DataFrame(cp_summary_rows)
+        cp_df2 = pd.read_csv("cp_summary_customS.csv") if os.path.exists("cp_summary_customS.csv") else pd.DataFrame()
+        bio_all_df = pd.read_csv("biopla_prediction_all_models.csv") if os.path.exists("biopla_prediction_all_models.csv") else pd.DataFrame()
+        bio_cs_df  = pd.read_csv("biopla_prediction_all_models_customS.csv") if os.path.exists("biopla_prediction_all_models_customS.csv") else pd.DataFrame()
+
+        with ExcelWriter("summary_outputs.xlsx", engine="openpyxl") as writer:
+            perf_df.to_excel(writer, sheet_name="Performance", index=False)
+            pd.DataFrame([{"k": "used_models_for_consensus", "v": str(fixed_names)}]).to_excel(
+                writer, sheet_name="ConsensusInfo", index=False
+            )
+            cp_df.to_excel(writer, sheet_name=f"CP_Summary(ACE-{ACE_KIND})", index=False)
+            if not cp_df2.empty:
+                cp_df2.to_excel(writer, sheet_name="CP_Summary(CustomS)", index=False)
+            if not bio_all_df.empty:
+                bio_all_df.to_excel(writer, sheet_name="biopla_pred_all", index=False)
+            if not bio_cs_df.empty:
+                bio_cs_df.to_excel(writer, sheet_name="biopla_pred_customS", index=False)
+            if os.path.exists("cls_cp_width_conditional_bins.csv"):
+                pd.read_csv("cls_cp_width_conditional_bins.csv").to_excel(writer, sheet_name="WidthBins", index=False)
+            if os.path.exists("cls_cp_width_conditional_MAE.csv"):
+                pd.read_csv("cls_cp_width_conditional_MAE.csv").to_excel(writer, sheet_name="WidthMAE", index=False)
+            if os.path.exists("cls_cp_width_customS_conditional_bins.csv"):
+                pd.read_csv("cls_cp_width_customS_conditional_bins.csv").to_excel(writer, sheet_name="WidthBins_CustomS", index=False)
+            if os.path.exists("cls_cp_width_customS_conditional_MAE.csv"):
+                pd.read_csv("cls_cp_width_customS_conditional_MAE.csv").to_excel(writer, sheet_name="WidthMAE_CustomS", index=False)
+        print("[OK] Saved: summary_outputs.xlsx")
+    except Exception as e:
+        print(f"[Warn] Excel summary not written: {e}")
+
+    print("\n[Done] Pipeline finished.")
+
+if __name__ == "__main__":
+    main()
